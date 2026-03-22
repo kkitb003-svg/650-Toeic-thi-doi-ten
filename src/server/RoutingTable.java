@@ -1,35 +1,68 @@
 package server;
 
+import java.net.URI;
+
 public class RoutingTable {
 
-    public VirtualCircle table[];
-    public int max = 6;
+    private final VirtualCircle[] table;
 
-    public RoutingTable(String peers) {
-        table = new VirtualCircle[6];
-        
-        // Handle empty, null, or placeholder PEERS
-        if (peers == null || peers.trim().isEmpty() || peers.contains("(will be set by PM later)")) {
-            System.out.println("[WARNING] PEERS not set - using localhost defaults");
-            peers = "localhost:8080,localhost:8080,localhost:8080,localhost:8080,localhost:8080,localhost:8080";
-        }
-        
+    public RoutingTable(String peers, int defaultPort) {
         String[] peerList = peers.split(",");
-        
-        // Check if we have exactly 6 peers
-        if (peerList.length != 6) {
-            System.out.println("[ERROR] Expected 6 peers, got " + peerList.length);
-            System.out.println("[ERROR] PEERS input: " + peers);
-            throw new IllegalArgumentException("PEERS must contain exactly 6 comma-separated values (hostname:port)");
+        table = new VirtualCircle[peerList.length];
+
+        for (int i = 0; i < peerList.length; i++) {
+            table[i] = parsePeer(peerList[i].trim(), i + 1, defaultPort);
         }
-        
-        for (int i = 0; i < 6; i++) {
-            String[] parts = peerList[i].trim().split(":");
-            if (parts.length != 2) {
-                throw new IllegalArgumentException("Invalid peer format at index " + i + ": " + peerList[i] + " (expected hostname:port)");
+    }
+
+    private VirtualCircle parsePeer(String rawPeer, int nodeNumber, int defaultPort) {
+        if (rawPeer == null || rawPeer.isEmpty()) {
+            throw new IllegalArgumentException("Peer entry " + nodeNumber + " is empty");
+        }
+
+        String host;
+        int port = defaultPort;
+
+        if (rawPeer.contains("://")) {
+            URI uri = URI.create(rawPeer);
+            host = uri.getHost();
+            if (host == null || host.trim().isEmpty()) {
+                throw new IllegalArgumentException("Invalid peer URI: " + rawPeer);
             }
-            table[i] = new VirtualCircle(parts[0].trim(), Integer.parseInt(parts[1].trim()), "Server" + (i+1));
+            if (uri.getPort() > 0) {
+                port = uri.getPort();
+            }
+        } else if (rawPeer.contains(":")) {
+            int lastColon = rawPeer.lastIndexOf(':');
+            host = rawPeer.substring(0, lastColon).trim();
+            port = Integer.parseInt(rawPeer.substring(lastColon + 1).trim());
+        } else {
+            host = rawPeer.trim();
         }
-        max = 6;
+
+        return new VirtualCircle(nodeNumber, host, port, "Node" + nodeNumber);
+    }
+
+    public VirtualCircle getPeer(int nodeNumber) {
+        return table[nodeNumber - 1];
+    }
+
+    public int size() {
+        return table.length;
+    }
+
+    public String describe() {
+        StringBuilder builder = new StringBuilder();
+        for (int i = 0; i < table.length; i++) {
+            if (i > 0) {
+                builder.append(", ");
+            }
+            builder.append(table[i].getNodeId())
+                    .append("=")
+                    .append(table[i].getDestination())
+                    .append(":")
+                    .append(table[i].getPort());
+        }
+        return builder.toString();
     }
 }

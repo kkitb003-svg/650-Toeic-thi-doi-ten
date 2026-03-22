@@ -1,144 +1,181 @@
 package client;
 
-import java.awt.*;
-import java.awt.event.*;
-import javax.swing.*;
-import java.io.*;
-import java.net.*;
+import java.awt.BorderLayout;
+import java.awt.GridLayout;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.PrintWriter;
+import java.net.Socket;
+import java.net.URI;
+import javax.swing.JButton;
+import javax.swing.JComboBox;
+import javax.swing.JFrame;
+import javax.swing.JLabel;
+import javax.swing.JPanel;
+import javax.swing.JScrollPane;
+import javax.swing.JTextArea;
+import javax.swing.JTextField;
 
 public class Client extends JFrame {
 
+    private static final NodeEndpoint[] DEFAULT_ENDPOINTS = new NodeEndpoint[]{
+            new NodeEndpoint("localhost", 2001),
+            new NodeEndpoint("localhost", 2002)
+    };
+
+    private final NodeEndpoint[] endpoints;
     private JComboBox<Integer> nodeSelector;
-    private JTextField idField, contentField;
-    private JButton insertButton, deleteButton, queryButton;
+    private JTextField jobIdField;
+    private JTextField contentField;
     private JTextArea resultArea;
-    private static final int[] PORTS = {2001, 2002, 2003, 2004, 2005, 2006};
 
     public Client() {
-        setTitle("Token Ring System - Universal Client (Test)");
-        setSize(700, 500);
+        this.endpoints = loadEndpoints();
+
+        setTitle("Distributed Print Client");
+        setSize(760, 520);
         setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
         setLayout(new BorderLayout());
 
-        // Control panel
         JPanel controlPanel = new JPanel(new GridLayout(4, 2, 5, 5));
-        
-        controlPanel.add(new JLabel("Select Node:"));
-        nodeSelector = new JComboBox<>(new Integer[]{1, 2, 3, 4, 5, 6});
+        controlPanel.add(new JLabel("Select Print Server:"));
+        nodeSelector = new JComboBox<>(buildNodeChoices());
         nodeSelector.setSelectedIndex(0);
         controlPanel.add(nodeSelector);
 
-        controlPanel.add(new JLabel("Data ID:"));
-        idField = new JTextField();
-        controlPanel.add(idField);
+        controlPanel.add(new JLabel("Job ID:"));
+        jobIdField = new JTextField();
+        controlPanel.add(jobIdField);
 
-        controlPanel.add(new JLabel("Content:"));
+        controlPanel.add(new JLabel("Document Content:"));
         contentField = new JTextField();
         controlPanel.add(contentField);
 
         JPanel buttonPanel = new JPanel();
-        insertButton = new JButton("Insert Data");
-        deleteButton = new JButton("Delete Data");
-        queryButton = new JButton("Query All");
-        buttonPanel.add(insertButton);
-        buttonPanel.add(deleteButton);
+        JButton printButton = new JButton("Submit Print Job");
+        JButton cancelButton = new JButton("Cancel Job");
+        JButton queryButton = new JButton("Query Jobs");
+        JButton statusButton = new JButton("Ring Status");
+        buttonPanel.add(printButton);
+        buttonPanel.add(cancelButton);
         buttonPanel.add(queryButton);
+        buttonPanel.add(statusButton);
 
         resultArea = new JTextArea();
         resultArea.setEditable(false);
-        JScrollPane scroll = new JScrollPane(resultArea);
 
         add(controlPanel, BorderLayout.NORTH);
         add(buttonPanel, BorderLayout.CENTER);
-        add(scroll, BorderLayout.SOUTH);
+        add(new JScrollPane(resultArea), BorderLayout.SOUTH);
 
-        insertButton.addActionListener(e -> sendInsertRequest());
-        deleteButton.addActionListener(e -> sendDeleteRequest());
-        queryButton.addActionListener(e -> sendQueryRequest());
+        printButton.addActionListener(e -> submitPrintJob());
+        cancelButton.addActionListener(e -> cancelJob());
+        queryButton.addActionListener(e -> sendCommand("QUERY", "Job log"));
+        statusButton.addActionListener(e -> sendCommand("STATUS", "Ring status"));
 
         setVisible(true);
     }
 
-    private void sendInsertRequest() {
-        int nodeId = (Integer) nodeSelector.getSelectedItem();
-        int port = PORTS[nodeId - 1];
-        String id = idField.getText();
-        String content = contentField.getText();
+    private Integer[] buildNodeChoices() {
+        Integer[] nodeChoices = new Integer[endpoints.length];
+        for (int i = 0; i < endpoints.length; i++) {
+            nodeChoices[i] = i + 1;
+        }
+        return nodeChoices;
+    }
 
-        if (id.isEmpty() || content.isEmpty()) {
-            resultArea.append("Error: ID and Content cannot be empty\n");
+    private void submitPrintJob() {
+        String jobId = jobIdField.getText().trim();
+        String content = contentField.getText().trim();
+        if (jobId.isEmpty() || content.isEmpty()) {
+            resultArea.append("Error: Job ID and document content cannot be empty\n");
             return;
         }
 
-        try {
-            Socket socket = new Socket("localhost", port);
-            PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
-            BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-
-            String message = "INSERT|" + id + "|" + content;
-            out.println(message);
-
-            String response = in.readLine();
-            resultArea.append("[Node " + nodeId + "] Insert response: " + response + "\n");
-
-            socket.close();
-        } catch (Exception ex) {
-            resultArea.append("Error connecting to Node " + nodeId + ": " + ex.getMessage() + "\n");
-        }
+        sendCommand("PRINT|" + jobId + "|" + content, "Submit print job");
     }
 
-    private void sendDeleteRequest() {
-        int nodeId = (Integer) nodeSelector.getSelectedItem();
-        int port = PORTS[nodeId - 1];
-        String id = idField.getText();
-
-        if (id.isEmpty()) {
-            resultArea.append("Error: ID cannot be empty\n");
+    private void cancelJob() {
+        String jobId = jobIdField.getText().trim();
+        if (jobId.isEmpty()) {
+            resultArea.append("Error: Job ID cannot be empty\n");
             return;
         }
 
-        try {
-            Socket socket = new Socket("localhost", port);
-            PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
-            BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-
-            String message = "DELETE|" + id;
-            out.println(message);
-
-            String response = in.readLine();
-            resultArea.append("[Node " + nodeId + "] Delete response: " + response + "\n");
-
-            socket.close();
-        } catch (Exception ex) {
-            resultArea.append("Error connecting to Node " + nodeId + ": " + ex.getMessage() + "\n");
-        }
+        sendCommand("CANCEL|" + jobId, "Cancel job");
     }
 
-    private void sendQueryRequest() {
-        int nodeId = (Integer) nodeSelector.getSelectedItem();
-        int port = PORTS[nodeId - 1];
+    private void sendCommand(String command, String label) {
+        int selectedNode = (Integer) nodeSelector.getSelectedItem();
+        NodeEndpoint endpoint = endpoints[selectedNode - 1];
 
-        try {
-            Socket socket = new Socket("localhost", port);
-            PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
-            BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+        try (Socket socket = new Socket(endpoint.host, endpoint.port);
+             PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
+             BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()))) {
 
-            out.println("QUERY");
+            out.println(command);
+            resultArea.append("\n[Node " + selectedNode + " - " + endpoint.host + ":" + endpoint.port + "] " + label + ":\n");
 
             String line;
-            resultArea.append("\n[Node " + nodeId + "] Data:\n");
-            while ((line = in.readLine()) != null && !line.isEmpty()) {
+            boolean hasOutput = false;
+            while ((line = in.readLine()) != null) {
                 resultArea.append(line + "\n");
+                hasOutput = true;
             }
-            resultArea.append("---\n");
 
-            socket.close();
+            if (!hasOutput) {
+                resultArea.append("(no response)\n");
+            }
+
+            resultArea.append("---\n");
         } catch (Exception ex) {
-            resultArea.append("Error connecting to Node " + nodeId + ": " + ex.getMessage() + "\n");
+            resultArea.append("Error connecting to Node " + selectedNode + " (" + endpoint.host + ":" + endpoint.port + "): "
+                    + ex.getMessage() + "\n");
         }
+    }
+
+    private NodeEndpoint[] loadEndpoints() {
+        String configuredNodes = System.getenv("NODE_ADDRESSES");
+        if (configuredNodes == null || configuredNodes.trim().isEmpty()) {
+            return DEFAULT_ENDPOINTS;
+        }
+
+        String[] rawNodes = configuredNodes.split(",");
+        NodeEndpoint[] parsed = new NodeEndpoint[rawNodes.length];
+        for (int i = 0; i < rawNodes.length; i++) {
+            parsed[i] = parseEndpoint(rawNodes[i].trim());
+        }
+        return parsed;
+    }
+
+    private NodeEndpoint parseEndpoint(String rawValue) {
+        if (rawValue.contains("://")) {
+            URI uri = URI.create(rawValue);
+            int port = uri.getPort() > 0 ? uri.getPort() : 8080;
+            return new NodeEndpoint(uri.getHost(), port);
+        }
+
+        if (rawValue.contains(":")) {
+            int lastColon = rawValue.lastIndexOf(':');
+            String host = rawValue.substring(0, lastColon).trim();
+            int port = Integer.parseInt(rawValue.substring(lastColon + 1).trim());
+            return new NodeEndpoint(host, port);
+        }
+
+        return new NodeEndpoint(rawValue, 8080);
     }
 
     public static void main(String[] args) {
         new Client();
+    }
+
+    private static class NodeEndpoint {
+        private final String host;
+        private final int port;
+
+        private NodeEndpoint(String host, int port) {
+            this.host = host;
+            this.port = port;
+        }
     }
 }

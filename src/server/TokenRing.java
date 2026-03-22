@@ -2,90 +2,298 @@ package server;
 
 import java.io.IOException;
 import java.io.PrintWriter;
+import java.net.InetSocketAddress;
 import java.net.Socket;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.ArrayDeque;
+import java.util.Queue;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class TokenRing {
 
-    private int nodeId;
-    private RoutingTable routing;
-    private boolean hasToken;
-    private Database db;
-    private AtomicInteger lamportClock;
-    private int tokenCount = 0;
+    private static final String META_COORDINATOR_EPOCH = "coordinator_epoch";
+    private static final String META_HIGHEST_EPOCH = "highest_seen_epoch";
+    private static final String META_HIGHEST_SEQUENCE = "highest_seen_sequence";
 
-    public TokenRing(int nodeId, RoutingTable routing, boolean hasToken, Database db, AtomicInteger lamportClock) {
+    private final int nodeId;
+    private final RoutingTable routing;
+    private final Database db;
+    private final AtomicLong lamportClock;
+    private final Queue<ProcessData> pendingJobs = new ArrayDeque<>();
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
+    private final long tokenPassDelayMs;
+    private final long tokenMonitorIntervalMs;
+    private final long tokenLossTimeoutMs;
+    private final int connectTimeoutMs;
+
+    private volatile boolean hasToken;
+    private volatile long tokenEpoch;
+    private volatile long tokenSequence;
+    private volatile long highestSeenEpoch;
+    private volatile long highestSeenSequence;
+    private volatile long lastTokenActivityAt = System.currentTimeMillis();
+    private volatile long recoveryCount = 0;
+    private ScheduledFuture<?> scheduledPass;
+
+    public TokenRing(int nodeId, RoutingTable routing, Database db, AtomicLong lamportClock,
+                     long tokenPassDelayMs, long tokenMonitorIntervalMs, long tokenLossTimeoutMs,
+                     int connectTimeoutMs) {
         this.nodeId = nodeId;
         this.routing = routing;
-        this.hasToken = hasToken;
         this.db = db;
         this.lamportClock = lamportClock;
+        this.tokenPassDelayMs = tokenPassDelayMs;
+        this.tokenMonitorIntervalMs = tokenMonitorIntervalMs;
+        this.tokenLossTimeoutMs = tokenLossTimeoutMs;
+        this.connectTimeoutMs = connectTimeoutMs;
+        this.highestSeenEpoch = db.getLongMetadata(META_HIGHEST_EPOCH, 0L);
+        this.highestSeenSequence = db.getLongMetadata(META_HIGHEST_SEQUENCE, 0L);
     }
 
-    public synchronized void processRequest(String message) {
-        lamportClock.incrementAndGet();
-        System.out.println("[Node " + nodeId + "] Processing request with Lamport clock: " + lamportClock.get());
-        System.out.println("[Node " + nodeId + "] Message: " + message);
+    public synchronized void start() {
+        scheduler.scheduleAtFixedRate(this::checkTokenHealth,
+                tokenMonitorIntervalMs, tokenMonitorIntervalMs, TimeUnit.MILLISECONDS);
 
-        // Parse and store data
-        String[] parts = message.split("\\|");
-        if (parts.length >= 3) {
-            String id = parts[0];
-            String content = parts[1];
-            String time = String.valueOf(System.currentTimeMillis());
-            String status = "processed";
-            db.insertData(id, content, time, status);
-            System.out.println("[Node " + nodeId + "] Data stored in DB");
+        if (nodeId == 1 && db.getLongMetadata(META_COORDINATOR_EPOCH, 0L) == 0L) {
+            issueNewToken("initial startup");
         }
     }
 
-    public synchronized void passToken() {
+    public synchronized String submitPrintJob(String payload) {
+        long requestLamport = lamportClock.incrementAndGet();
+        ProcessData request = ProcessData.parsePrintPayload(payload, nodeId, requestLamport);
+        if (request == null) {
+            return "ERROR|Expected PRINT|jobId|documentContent";
+        }
+
+        pendingJobs.add(request);
+        System.out.println("[Node " + nodeId + "] Queued print job " + request.getJobId()
+                + " at Lamport " + requestLamport);
+
+        if (hasToken) {
+            processPendingJobsLocked();
+            scheduleTokenPassLocked(tokenPassDelayMs);
+        }
+
+        return hasToken
+                ? "OK|Print job accepted and this node currently owns the token"
+                : "OK|Print job queued until token arrives";
+    }
+
+    public synchronized String submitCancelJob(String jobId) {
+        long requestLamport = lamportClock.incrementAndGet();
+        ProcessData request = ProcessData.cancelRequest(jobId, nodeId, requestLamport);
+        if (request == null) {
+            return "ERROR|Expected CANCEL|jobId";
+        }
+
+        pendingJobs.add(request);
+        System.out.println("[Node " + nodeId + "] Queued cancel request for " + request.getJobId()
+                + " at Lamport " + requestLamport);
+
+        if (hasToken) {
+            processPendingJobsLocked();
+            scheduleTokenPassLocked(tokenPassDelayMs);
+        }
+
+        return hasToken
+                ? "OK|Cancel request accepted and this node currently owns the token"
+                : "OK|Cancel request queued until token arrives";
+    }
+
+    public synchronized boolean receiveToken(int fromNode, long fromLamport, long epoch, long sequence) {
+        if (!isNewerToken(epoch, sequence)) {
+            System.out.println("[Node " + nodeId + "] Ignored stale or duplicate token epoch=" + epoch
+                    + " sequence=" + sequence);
+            return false;
+        }
+
+        lamportClock.set(Math.max(lamportClock.get(), fromLamport) + 1);
+        highestSeenEpoch = epoch;
+        highestSeenSequence = sequence;
+        tokenEpoch = epoch;
+        tokenSequence = sequence;
+        hasToken = true;
+        lastTokenActivityAt = System.currentTimeMillis();
+        persistHighestTokenState();
+
+        System.out.println("[Node " + nodeId + "] Accepted token from Node " + fromNode
+                + " | epoch=" + epoch + " | sequence=" + sequence
+                + " | lamport=" + lamportClock.get());
+
+        processPendingJobsLocked();
+        scheduleTokenPassLocked(tokenPassDelayMs);
+        return true;
+    }
+
+    public String getJobLog() {
+        return db.getAllJobs();
+    }
+
+    public synchronized String getStatus() {
+        return "STATUS|node=" + nodeId
+                + "|hasToken=" + hasToken
+                + "|pendingJobs=" + pendingJobs.size()
+                + "|lamport=" + lamportClock.get()
+                + "|tokenEpoch=" + tokenEpoch
+                + "|tokenSequence=" + tokenSequence
+                + "|highestSeenEpoch=" + highestSeenEpoch
+                + "|highestSeenSequence=" + highestSeenSequence
+                + "|recoveries=" + recoveryCount
+                + "|ringSize=" + routing.size();
+    }
+
+    public void shutdown() {
+        scheduler.shutdownNow();
+    }
+
+    private synchronized void processPendingJobsLocked() {
+        while (hasToken && !pendingJobs.isEmpty()) {
+            ProcessData request = pendingJobs.peek();
+            if (request == null) {
+                continue;
+            }
+
+            long processedLamport = lamportClock.incrementAndGet();
+            long processedAt = System.currentTimeMillis();
+            boolean success;
+
+            if (request.getOperation() == ProcessData.Operation.PRINT) {
+                System.out.println("[Node " + nodeId + "] Printing job " + request.getJobId()
+                        + " | submittedLamport=" + request.getSubmittedLamport()
+                        + " | processedLamport=" + processedLamport);
+                success = db.recordPrintedJob(request, nodeId, processedLamport, processedAt);
+            } else {
+                System.out.println("[Node " + nodeId + "] Cancelling job " + request.getJobId()
+                        + " | submittedLamport=" + request.getSubmittedLamport()
+                        + " | processedLamport=" + processedLamport);
+                success = db.recordCancelledJob(request, nodeId, processedLamport, processedAt);
+            }
+
+            if (success) {
+                pendingJobs.poll();
+            } else {
+                System.out.println("[Node " + nodeId + "] DB unavailable, keeping request in queue");
+                break;
+            }
+        }
+    }
+
+    private synchronized void scheduleTokenPassLocked(long delayMs) {
         if (!hasToken) {
-            System.out.println("[Node " + nodeId + "] Waiting for token...");
             return;
         }
 
-        tokenCount++;
-        System.out.println("[Node " + nodeId + "] Has token (count: " + tokenCount + "), passing to next node");
-
-        // Find next node
-        int nextNodeId = (nodeId % 6) + 1;
-        VirtualCircle nextNode = routing.table[nextNodeId - 1];
-
-        try {
-            Socket socket = new Socket(nextNode.destination, nextNode.port);
-            PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
-            out.println("TOKEN|" + nodeId + "|" + lamportClock.get());
-            socket.close();
-            System.out.println("[Node " + nodeId + "] Token passed to Node " + nextNodeId);
-        } catch (IOException e) {
-            System.out.println("[Node " + nodeId + "] Error passing token: " + e.getMessage());
+        if (scheduledPass != null && !scheduledPass.isDone()) {
+            scheduledPass.cancel(false);
         }
 
-        hasToken = false;
+        scheduledPass = scheduler.schedule(this::passTokenSafely, delayMs, TimeUnit.MILLISECONDS);
     }
 
-    public synchronized void receiveToken(int fromNode) {
-        lamportClock.incrementAndGet();
-        hasToken = true;
-        System.out.println("[Node " + nodeId + "] Received token from Node " + fromNode);
-        System.out.println("[Node " + nodeId + "] Lamport clock updated to: " + lamportClock.get());
-        
-        // Auto-pass token after short delay
-        new Thread(() -> {
-            try {
-                Thread.sleep(1000);
-                passToken();
-            } catch (InterruptedException e) {
+    private void passTokenSafely() {
+        synchronized (this) {
+            if (!hasToken) {
+                return;
             }
-        }).start();
+
+            if (routing.size() <= 1) {
+                System.out.println("[Node " + nodeId + "] Single-node ring, token stays local");
+                processPendingJobsLocked();
+                lastTokenActivityAt = System.currentTimeMillis();
+                return;
+            }
+
+            long nextSequence = tokenSequence + 1;
+            int totalNodes = routing.size();
+            int nextNodeId = nodeId;
+
+            for (int attempt = 1; attempt < totalNodes; attempt++) {
+                nextNodeId = (nextNodeId % totalNodes) + 1;
+                VirtualCircle nextNode = routing.getPeer(nextNodeId);
+                if (trySendToken(nextNodeId, nextNode, tokenEpoch, nextSequence)) {
+                    tokenSequence = nextSequence;
+                    highestSeenEpoch = tokenEpoch;
+                    highestSeenSequence = nextSequence;
+                    persistHighestTokenState();
+                    hasToken = false;
+                    lastTokenActivityAt = System.currentTimeMillis();
+                    return;
+                }
+            }
+
+            System.out.println("[Node " + nodeId + "] Could not pass token, keeping it and retrying");
+            scheduleTokenPassLocked(Math.max(tokenPassDelayMs, 2000L));
+        }
     }
 
-    public boolean hasToken() {
-        return hasToken;
+    private boolean trySendToken(int targetNodeId, VirtualCircle targetNode, long epoch, long sequence) {
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress(targetNode.getDestination(), targetNode.getPort()), connectTimeoutMs);
+            PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
+            long currentLamport = lamportClock.incrementAndGet();
+            out.println("TOKEN|" + nodeId + "|" + currentLamport + "|" + epoch + "|" + sequence);
+            System.out.println("[Node " + nodeId + "] Passed token to Node " + targetNodeId
+                    + " | epoch=" + epoch + " | sequence=" + sequence);
+            return true;
+        } catch (IOException ex) {
+            System.out.println("[Node " + nodeId + "] Failed to pass token to Node " + targetNodeId
+                    + ": " + ex.getMessage());
+            return false;
+        }
     }
 
-    public String getData() {
-        return db.getAllData();
+    private void checkTokenHealth() {
+        synchronized (this) {
+            if (hasToken) {
+                return;
+            }
+
+            long idleFor = System.currentTimeMillis() - lastTokenActivityAt;
+            if (idleFor < tokenLossTimeoutMs) {
+                return;
+            }
+
+            if (nodeId == 1) {
+                System.out.println("[Node 1] Token watchdog detected a lost token after " + idleFor + " ms");
+                issueNewToken("watchdog recovery");
+            }
+        }
+    }
+
+    private void issueNewToken(String reason) {
+        long nextEpoch = Math.max(db.getLongMetadata(META_COORDINATOR_EPOCH, 0L), highestSeenEpoch) + 1;
+        long currentLamport = lamportClock.incrementAndGet();
+
+        db.putLongMetadata(META_COORDINATOR_EPOCH, nextEpoch);
+        tokenEpoch = nextEpoch;
+        tokenSequence = 1L;
+        highestSeenEpoch = nextEpoch;
+        highestSeenSequence = 1L;
+        hasToken = true;
+        if (!"initial startup".equals(reason)) {
+            recoveryCount++;
+        }
+        lastTokenActivityAt = System.currentTimeMillis();
+        persistHighestTokenState();
+
+        System.out.println("[Node " + nodeId + "] Issued new token | reason=" + reason
+                + " | epoch=" + tokenEpoch + " | sequence=" + tokenSequence
+                + " | lamport=" + currentLamport);
+
+        processPendingJobsLocked();
+        scheduleTokenPassLocked(tokenPassDelayMs);
+    }
+
+    private boolean isNewerToken(long epoch, long sequence) {
+        return epoch > highestSeenEpoch || (epoch == highestSeenEpoch && sequence > highestSeenSequence);
+    }
+
+    private void persistHighestTokenState() {
+        db.putLongMetadata(META_HIGHEST_EPOCH, highestSeenEpoch);
+        db.putLongMetadata(META_HIGHEST_SEQUENCE, highestSeenSequence);
     }
 }

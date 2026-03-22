@@ -1,58 +1,143 @@
-# Distributed Token Ring System
+# Distributed Print Ring
 
-This project implements a distributed system with 6 servers in a virtual ring using the Token Ring algorithm (jeton) for mutual exclusion and fault tolerance.
+This project models a distributed print service with 2 servers arranged in a virtual ring and 1 client that submits print jobs.
 
-## Features
-- 6 servers in virtual ring topology with token passing
-- Lamport clock for event ordering across nodes
-- Each node has its own MySQL database
-- 1 universal client for testing and sending data
-- Token cycles through the ring: Node1 → Node2 → ... → Node6 → Node1
+The focus is the Token Ring algorithm. Real printing is not required; each server writes a reasonable print log to MySQL and console output.
 
-## Project Structure
-- `src/client/`: 1 universal client application to test all nodes
-- `src/server/`: Server components (Main, TokenRing, NodeHandler, Database, etc.)
+## Why Lamport clock is still reasonable here
 
-## How to Run Locally
+Lamport clock is not required to make Token Ring work, because the token itself already provides mutual exclusion.
 
-1. Build: `javac -cp build -d build src/server/*.java src/client/*.java`
-2. Setup DB: Run `setup.sql` to create databases and tables.
-3. Start servers (each in separate terminal):
-   ```
-   NODE_ID=1 PORT=2001 MYSQL_URL=jdbc:mysql://localhost:3306/db1 java -cp build server.Main
-   NODE_ID=2 PORT=2002 MYSQL_URL=jdbc:mysql://localhost:3306/db2 java -cp build server.Main
-   ...
-   NODE_ID=6 PORT=2006 MYSQL_URL=jdbc:mysql://localhost:3306/db6 java -cp build server.Main
-   ```
-4. Run client: `java -cp build client.Client`
+It is still useful in this project because it helps:
 
-## Deploy to Railway
+- explain the logical order of distributed events,
+- show when a job was queued versus when it was actually printed,
+- make logs and database records easier to defend in a cloud/distributed-systems demo.
 
-Each team member:
-1. Fork the repo to your GitHub.
-2. Create Railway account and new project from forked repo.
-3. Add MySQL plugin for each project.
-4. Set Environment Variables:
-   - `NODE_ID` (1-6, unique per person)
-   - `PORT` (8080, auto-assigned by Railway)
-   - `MYSQL_URL` (from MySQL plugin)
-   - `PEERS` (Railway URLs of all 6 nodes)
-5. Deploy and get your URL.
+So in this implementation:
 
-## Token Ring Algorithm
+- Token Ring is the main synchronization mechanism.
+- Lamport clock is supporting metadata for event ordering and observability.
 
-- Node 1 starts with the token.
-- When a node has the token, it can process requests and store data.
-- Token passes to the next node in the ring automatically.
-- Lamport clock updates with each message to maintain causal ordering.
+## System model
 
-## Project Structure
-- `src/client/`: Client applications (GUI and Web)
-- `src/server/`: Server components (Main, handlers, database, etc.)
+- 2 print servers in one virtual ring
+- 1 client sends print or cancel requests to any server
+- Each server keeps a local queue of pending jobs
+- Only the server holding the token may enter the critical section and update its print log
+- Print results are stored in MySQL tables `print_jobs` and `ring_metadata`
 
-## How to Run
-1. Install JDK and MySQL.
-2. Create databases: db1 to db6 with tables server1 to server6.
-3. Run InitialServer for each server.
-4. Run Server1 to Server6 in separate terminals.
-5. Run Client to interact via GUI or web interface.
+## Message protocol
+
+- `PRINT|jobId|documentContent`
+- `CANCEL|jobId`
+- `QUERY`
+- `STATUS`
+- Token transfer between servers: `TOKEN|fromNode|lamport|epoch|sequence`
+
+Legacy aliases are also accepted:
+
+- `INSERT|jobId|documentContent` behaves like `PRINT`
+- `DELETE|jobId` behaves like `CANCEL`
+
+## Token Ring behavior
+
+1. Node 1 creates the initial token.
+2. A client can submit a print job to any node.
+3. That node queues the job immediately.
+4. When the token arrives, the node processes queued jobs in order.
+5. The node logs the print or cancel result in MySQL and console output.
+6. After `TOKEN_PASS_DELAY_MS`, the token is sent to the next node in the ring.
+
+## Token loss recovery and duplicate-token protection
+
+This project now includes both items that were missing before:
+
+- Lost token detection:
+  Node 1 runs a watchdog. If no token activity is observed for `TOKEN_LOSS_TIMEOUT_MS`, it regenerates a new token.
+- Duplicate token protection:
+  Every token carries `epoch` and `sequence`.
+  Each node stores the highest token it has seen in `ring_metadata`.
+  Any stale or duplicate token is ignored.
+
+This is intentionally simple and centralized through Node 1, which keeps the design easy to explain while still solving the common demo failure cases.
+
+## Files that matter
+
+- [src/server/Main.java](C:/Users/Administrator/Desktop/DistributedSystemProject/src/server/Main.java)
+- [src/server/TokenRing.java](C:/Users/Administrator/Desktop/DistributedSystemProject/src/server/TokenRing.java)
+- [src/server/Database.java](C:/Users/Administrator/Desktop/DistributedSystemProject/src/server/Database.java)
+- [src/server/NodeHandler.java](C:/Users/Administrator/Desktop/DistributedSystemProject/src/server/NodeHandler.java)
+- [src/server/ProcessData.java](C:/Users/Administrator/Desktop/DistributedSystemProject/src/server/ProcessData.java)
+- [src/server/RoutingTable.java](C:/Users/Administrator/Desktop/DistributedSystemProject/src/server/RoutingTable.java)
+- [src/client/Client.java](C:/Users/Administrator/Desktop/DistributedSystemProject/src/client/Client.java)
+
+The folder `BaiDoXe/` is only a teacher-style sample reference and is not part of the active runtime.
+
+## Local build
+
+Windows PowerShell:
+
+```powershell
+javac -cp "lib/*" -d build src\server\*.java src\client\*.java
+```
+
+Linux/macOS:
+
+```bash
+javac -cp "lib/*" -d build src/server/*.java src/client/*.java
+```
+
+## Local run example
+
+Run 2 nodes in 2 terminals:
+
+```powershell
+$env:NODE_ID="1"; $env:PORT="2001"; $env:MYSQL_URL="jdbc:mysql://localhost:3306/print_ring_demo"; $env:PEERS="localhost:2001,localhost:2002"; java -cp "build;lib/*" server.Main
+$env:NODE_ID="2"; $env:PORT="2002"; $env:MYSQL_URL="jdbc:mysql://localhost:3306/print_ring_demo"; $env:PEERS="localhost:2001,localhost:2002"; java -cp "build;lib/*" server.Main
+```
+
+Run the client:
+
+```powershell
+java -cp "build;lib/*" client.Client
+```
+
+## Railway deployment
+
+Deploy 2 Railway services from the same repository.
+
+Each service needs:
+
+- `NODE_ID`: `1` or `2`
+- `PORT`: `8080`
+- `BIND_HOST`: `0.0.0.0`
+- `MYSQL_URL`: database URL
+- `PEERS`: both service addresses in ring order
+- `TOKEN_PASS_DELAY_MS`: optional, default `1500`
+- `TOKEN_MONITOR_INTERVAL_MS`: optional, default `2000`
+- `TOKEN_LOSS_TIMEOUT_MS`: optional, default `12000`
+- `SOCKET_CONNECT_TIMEOUT_MS`: optional, default `3000`
+
+Example `PEERS`:
+
+```text
+node1.railway.internal:8080,node2.railway.internal:8080
+```
+
+The repo already includes:
+
+- [Dockerfile](C:/Users/Administrator/Desktop/DistributedSystemProject/Dockerfile)
+- [start.sh](C:/Users/Administrator/Desktop/DistributedSystemProject/start.sh)
+- [railway.toml](C:/Users/Administrator/Desktop/DistributedSystemProject/railway.toml)
+
+Railway docs used for the deployment assumptions:
+
+- [Builds](https://docs.railway.com/deploy/builds)
+- [Variables](https://docs.railway.com/variables)
+
+## Optional SQL bootstrap
+
+If you want to pre-create the local shared database, use [setup.sql](C:/Users/Administrator/Desktop/DistributedSystemProject/setup.sql).
+
+In normal use, the application will auto-create node-specific tables such as `node1_print_jobs`, `node1_ring_metadata`, `node2_print_jobs`, and `node2_ring_metadata` after the target database exists.

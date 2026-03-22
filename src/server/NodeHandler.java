@@ -1,63 +1,77 @@
 package server;
 
-import java.io.*;
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.PrintWriter;
 import java.net.Socket;
-import java.util.concurrent.atomic.AtomicInteger;
 
 public class NodeHandler implements Runnable {
 
-    private Socket clientSocket;
-    private int nodeId;
-    private TokenRing tokenRing;
-    private Database db;
-    private AtomicInteger lamportClock;
+    private final Socket clientSocket;
+    private final int nodeId;
+    private final TokenRing tokenRing;
 
-    public NodeHandler(Socket socket, int nodeId, TokenRing tokenRing, Database db, AtomicInteger lamportClock) {
+    public NodeHandler(Socket socket, int nodeId, TokenRing tokenRing) {
         this.clientSocket = socket;
         this.nodeId = nodeId;
         this.tokenRing = tokenRing;
-        this.db = db;
-        this.lamportClock = lamportClock;
     }
 
     @Override
     public void run() {
-        try {
-            BufferedReader in = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()));
-            PrintWriter out = new PrintWriter(clientSocket.getOutputStream(), true);
+        try (Socket socket = clientSocket;
+             BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+             PrintWriter out = new PrintWriter(socket.getOutputStream(), true)) {
 
             String message = in.readLine();
-            if (message == null) return;
-
-            System.out.println("[Node " + nodeId + "] Received from client: " + message);
-
-            if (message.startsWith("TOKEN|")) {
-                // Token message
-                String[] parts = message.split("\\|");
-                int fromNode = Integer.parseInt(parts[1]);
-                int fromLamport = Integer.parseInt(parts[2]);
-                lamportClock.set(Math.max(lamportClock.get(), fromLamport) + 1);
-                tokenRing.receiveToken(fromNode);
-                out.println("TOKEN_RECEIVED");
-            } else if (message.startsWith("QUERY")) {
-                // Query all data
-                out.println(tokenRing.getData());
-            } else if (message.startsWith("INSERT|")) {
-                // Insert data request
-                tokenRing.processRequest(message.substring(7));
-                out.println("Data received and will be processed when token arrives");
-            } else if (message.startsWith("DELETE|")) {
-                // Delete data request
-                String id = message.substring(7);
-                db.delData(id);
-                out.println("Data deleted");
-            } else {
-                out.println("Unknown command");
+            if (message == null || message.trim().isEmpty()) {
+                out.println("ERROR|Empty request");
+                return;
             }
 
-            clientSocket.close();
+            System.out.println("[Node " + nodeId + "] Received: " + message);
+
+            if (message.startsWith("TOKEN|")) {
+                handleTokenMessage(message, out);
+            } else if ("QUERY".equalsIgnoreCase(message)) {
+                String data = tokenRing.getJobLog();
+                out.print(data);
+                if (!data.endsWith("\n")) {
+                    out.print("\n");
+                }
+                out.flush();
+            } else if ("STATUS".equalsIgnoreCase(message) || "PING".equalsIgnoreCase(message)) {
+                out.println(tokenRing.getStatus());
+            } else if (message.startsWith("PRINT|") || message.startsWith("INSERT|")) {
+                out.println(tokenRing.submitPrintJob(message.substring(message.indexOf('|') + 1)));
+            } else if (message.startsWith("CANCEL|") || message.startsWith("DELETE|")) {
+                out.println(tokenRing.submitCancelJob(message.substring(message.indexOf('|') + 1)));
+            } else {
+                out.println("ERROR|Unknown command");
+            }
         } catch (IOException e) {
-            e.printStackTrace();
+            System.out.println("[Node " + nodeId + "] Handler error: " + e.getMessage());
+        }
+    }
+
+    private void handleTokenMessage(String message, PrintWriter out) {
+        String[] parts = message.split("\\|", 6);
+        if (parts.length < 5) {
+            out.println("ERROR|Invalid token payload");
+            return;
+        }
+
+        try {
+            int fromNode = Integer.parseInt(parts[1]);
+            long fromLamport = Long.parseLong(parts[2]);
+            long epoch = Long.parseLong(parts[3]);
+            long sequence = Long.parseLong(parts[4]);
+
+            boolean accepted = tokenRing.receiveToken(fromNode, fromLamport, epoch, sequence);
+            out.println(accepted ? "TOKEN_RECEIVED" : "TOKEN_IGNORED");
+        } catch (NumberFormatException ex) {
+            out.println("ERROR|Invalid token metadata");
         }
     }
 }

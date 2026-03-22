@@ -9,6 +9,7 @@ bin/
 dist/
 target/
 out/
+out-check/
 
 # IDE
 .idea/
