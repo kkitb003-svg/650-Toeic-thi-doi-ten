@@ -72,7 +72,6 @@ public class ServerManagerGUI extends JFrame {
         container.setBorder(BorderFactory.createTitledBorder("Man hinh xem log 6 server"));
 
         JPanel infoPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 6));
-        infoPanel.add(new JLabel("GUI nay chi doc log token tu 6 server, khong gui job in."));
 
         JPanel actionPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 6));
         JButton refreshButton = new JButton("Lam moi log");
@@ -125,7 +124,7 @@ public class ServerManagerGUI extends JFrame {
     private String[] buildNodeChoices() {
         String[] nodeChoices = new String[endpoints.length];
         for (int i = 0; i < endpoints.length; i++) {
-            nodeChoices[i] = "Server " + (i + 1) + " - " + endpoints[i].host + ":" + endpoints[i].port;
+            nodeChoices[i] = "Server " + (i + 1);
         }
         return nodeChoices;
     }

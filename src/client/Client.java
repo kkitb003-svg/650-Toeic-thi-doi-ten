@@ -88,7 +88,7 @@ public class Client extends JFrame {
     private String[] buildNodeChoices() {
         String[] nodeChoices = new String[endpoints.length];
         for (int i = 0; i < endpoints.length; i++) {
-            nodeChoices[i] = "May in " + (i + 1) + " - " + endpoints[i].host + ":" + endpoints[i].port;
+            nodeChoices[i] = "Server " + (i + 1);
         }
         return nodeChoices;
     }
